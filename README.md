@@ -1,32 +1,77 @@
-# Proyecto-Final
+# Documentación Técnica: Sistema de Clasificación Acústica en Tiempo Real Mediante Machine Learning Edge y Arquitectura Multinúcleo (ESP32-S3)
 
-Estado del Proyecto C.05: Detector de Ronquidos (ML Edge)
-Contexto rápido: Hemos tenido que pivotar la estrategia de visualización. Intentamos mandar los datos del micrófono por WiFi/WebSockets a una página web local, pero el micro I2S captura 16.000 muestras por segundo. Intentar mandar eso por WiFi saturaba la cola de mensajes del ESP32-S3 y la placa cortaba la conexión por seguridad. Para tener un proyecto robusto que soporte la IA más adelante, hemos pasado a una arquitectura profesional Dual Core con FreeRTOS y visualización en pantalla OLED física.
+---
 
-✅ Fases Completadas (Lo que ya tenemos)
-[x] Configuración Base: Entorno montado en PlatformIO para la ESP32-S3-DevKitC1.
+## 1. Resumen del Sistema
 
-[x] Captura de Audio (Hardware): Micrófono INMP441 conectado y configurado por bus I2S. Estamos leyendo datos crudos en contenedores de 32 bits a 16 kHz.
+El programa desarrollado es un firmware embebido para el microcontrolador **ESP32-S3** diseñado para capturar, procesar y clasificar señales de audio en tiempo real utilizando Inteligencia Artificial (**Edge Impulse**). El sistema es capaz de discriminar entre eventos acústicos específicos (**Tos** y **Ronquido**) de manera local (**Edge Computing**), sin dependencia de servidores en la nube. 
 
-[x] Arquitectura Multihilo (FreeRTOS): Hemos separado las tareas para no bloquear el procesador:
+Para garantizar que el sistema no se bloquee durante el pesado procesamiento de la red neuronal, el firmware se ha estructurado bajo un sistema operativo en tiempo real (**FreeRTOS**), dividiendo el trabajo de forma asíncrona entre los dos núcleos del procesador.
 
-Núcleo 0: Dedicado exclusivamente a leer el micrófono I2S mediante DMA (acceso directo a memoria).
+---
 
-Núcleo 1: Dedicado a actualizar la interfaz visual de forma segura usando semáforos (Mutex).
+## 2. Arquitectura de Software (Multiprocesamiento con FreeRTOS)
 
-[x] Código de Visualización: Implementación de la librería de Adafruit para dibujar la onda de audio en tiempo real en una pantalla OLED 0.96" (I2C).
+El firmware exprime la arquitectura *Dual-Core* del ESP32-S3 mediante la creación de dos tareas (`Tasks`) principales asignadas a núcleos físicos distintos:
 
-⏳ Próximos Pasos (Lo que toca hacer ahora)
-[ ] 1. Pruebas de Hardware (OLED): * Comentario: Hay que conectar físicamente la pantalla OLED a los pines I2C (SDA = 8, SCL = 9 en el código actual, modificables si es necesario) y subir el último código generado para verificar que la onda se dibuja a unos 30 FPS de forma fluida.
+### Núcleo 0: Tarea de Audio e Inferencia (`readAudioTask`)
+* **Prioridad:** Alta (2).
+* **Función:** Encargada de la captura crítica de datos del micrófono por hardware y de la ejecución de los algoritmos matemáticos de la red neuronal. 
+* **Razón del núcleo:** El muestreo de audio no puede perder muestras (*underflow*). Al asignarse en exclusiva al Núcleo 0, los cálculos de la IA no interrumpen la continuidad de la escucha.
 
-[ ] 2. Procesamiento de Señal (FFT):
+### Núcleo 1: Tarea de Interfaz Gráfica (`drawDisplayTask`)
+* **Prioridad:** Media-Baja (1).
+* **Función:** Encargada de la lógica de refresco de la pantalla y de preparar el búfer visual para el osciloscopio en vivo.
+* **Mecanismo de Seguridad:** Utiliza un **Mutex (`audioMutex`)**. Dado que ambas tareas intentan acceder al mismo búfer de datos de audio simultáneamente, el Mutex actúa como un semáforo que evita la corrupción de datos en la memoria RAM compartida.
 
-Comentario: Ahora mismo solo vemos la onda en crudo (dominio del tiempo). El siguiente paso técnico es integrar la librería arduinoFFT dentro del Núcleo 0. Hay que convertir esos bloques de audio en bandas de frecuencia (dominio de la frecuencia) para poder identificar patrones acústicos.
+---
 
-[ ] 3. Modelo de Machine Learning (TinyML):
+## 3. Bloques de Procesamiento y Lógica Operacional
 
-Comentario: Una vez tengamos las frecuencias claras, hay que capturar muestras (ronquidos vs. silencio/ruido de fondo) para entrenar una pequeña red neuronal. Luego, usaremos TensorFlow Lite Micro para correr ese modelo dentro del ESP32-S3 y que clasifique el sonido en tiempo real.
+### A. Adquisición de Datos por Protocolo I2S
+El micrófono digital (**INMP441**) transmite el audio en bruto a través del protocolo **I2S** en formato de 32 bits de alta fidelidad. El programa configura el periférico por hardware para realizar una lectura constante y limpia, convirtiendo posteriormente las muestras necesarias a floats y enteros de 16 bits requeridos por el clasificador.
 
-[ ] 4. Conectividad Final (Opcional/Según Rúbrica):
+### B. Algoritmo de Activación por Persistencia (Filtro Anti-Spam)
+Para evitar que el ruido blanco de la habitación o siseos breves saturen el monitor serie con falsas alertas, el código implementa un **filtro inteligente de persistencia**:
+1. El sistema evalúa constantemente la amplitud pico del sonido contra un `UMBRAL_ACTIVACION`.
+2. Si un ruido supera el umbral, un contador incrementa. Si cae el silencio, decrementa.
+3. **La IA solo se dispara si el ruido se mantiene fuerte durante un número consecutivo de bloques mínimos.** Esto asegura que el sistema solo reaccione ante sonidos deliberados y sostenidos (como una tos real o un vídeo de prueba).
+4. Tras ejecutar una inferencia, se aplica un bloqueo temporal de **1.5 segundos** (`vTaskDelay`) para ignorar ecos residuales o el final del propio sonido analizado.
 
-Comentario: Una vez el ML Edge detecte un "ronquido", usar la radio WiFi/Bluetooth del ESP32 para mandar un simple flag o alerta (esto ya no satura la red, porque solo se envía un mensaje tipo "Ronquido Detectado", en lugar de miles de números por segundo).
+### C. Clasificación de Audio (Machine Learning)
+Una vez superado el filtro de persistencia, se toman las muestras de audio equivalentes al tamaño de ventana de la IA (`EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE`). Los datos se inyectan en el clasificador de Edge Impulse (`run_classifier`). El modelo procesa la firma acústica y devuelve en el Monitor Serie las probabilidades exactas en porcentaje de las etiquetas entrenadas (`Tos` y `Ronquido`).
+
+### D. Procesamiento Gráfico (Osciloscopio)
+Independientemente de la IA, el código reduce la tasa de muestreo del búfer original de audio (*downsampling*) para adaptarlo proporcionalmente al ancho de una pantalla estándar (`SCREEN_WIDTH = 128`). Esto genera un array de coordenadas listo para ser pintado en forma de onda senoidal en tiempo real.
+
+---
+
+## 4. Flujo de Trabajo del Programa (Paso a Paso)
+
+```text
+[Inicio / Setup] 
+       │
+       ▼
+[Inicializar Periféricos e I2S] ───► [Creación de Mutex y Tasks (FreeRTOS)]
+                                                      │
+              ┌───────────────────────────────────────┴──────────────────────────────────────┐
+              ▼ (Núcleo 0)                                                                   ▼ (Núcleo 1)
+   [Lectura de Micrófono I2S]                                                       [Lectura de Buffer de Audio]
+              │                                                                              │ (Bloqueado por Mutex)
+              ▼                                                                              ▼
+   ¿Supera Umbral Acústico? ──(NO)──► [Bucle]                                        [Procesar Escala del Gráfico]
+              │ (SÍ)                                                                         │
+              ▼                                                                              ▼
+   ¿Ruido Sostenido? (Persistencia) ──(NO)──► [Bucle]                             [Mantener Pantalla Retroiluminada]
+              │ (SÍ)
+              ▼
+   [Capturar Ventana Completa (1s)]
+              │
+              ▼
+   [Ejecutar run_classifier()]
+              │
+              ▼
+   [Imprimir Resultados en Consola]
+              │
+              ▼
+   [Cooldown de Seguridad (1.5s)] ──► [Reiniciar Escucha]
